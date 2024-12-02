@@ -1,129 +1,26 @@
 use crate::buffer::Buffer;
+use crate::event::*;
 
 use std::{
     io::{Stdout, Write},
-    sync::{mpsc::Sender, Arc, Mutex},
+    sync::{Arc, Mutex},
 };
 
 use crossterm::{
-    cursor,
-    event::{self, read, KeyCode},
-    execute, queue,
+    cursor, execute, queue,
     style::{PrintStyledContent, Stylize},
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum Mode {
-    Normal,
-    Insert,
-}
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum Operator {
-    Delete,
-    Yank,
-}
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum Motion {
-    Up,
-    Down,
-    Left,
-    Right,
-
-    Start,
-    End,
-
-    Word,
-}
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum Event {
-    Quit,
-    ChangeMode(Mode),
-    Write(char),
-    BackSpace,
-    Enter,
-    Motion {
-        op: Option<Operator>,
-        mult: u8,
-        motion: Option<Motion>,
-    },
-    WindowResize(u16, u16),
-}
-
-fn event_listener(mode: Arc<Mutex<Mode>>, tx: Sender<Event>) {
-    let mut keys = Vec::new();
-
-    while let Ok(ev) = read() {
-        let action = match ev {
-            event::Event::Key(key_event) => {
-                // eprintln!("char {:?}", key_event.code);
-
-                match *mode.lock().unwrap() {
-                    Mode::Normal => handle_input_event_normal(key_event.code, &mut keys),
-                    Mode::Insert => handle_input_event_insert(key_event.code),
-                }
-            }
-            event::Event::Resize(cols, rows) => Some(Event::WindowResize(cols, rows)),
-            _ => None,
-        };
-
-        if let Some(action) = action {
-            tx.send(action).unwrap();
-        }
-    }
-}
-
-fn handle_input_event_insert(code: KeyCode) -> Option<Event> {
-    match code {
-        KeyCode::Esc => Some(Event::ChangeMode(Mode::Normal)),
-        KeyCode::Char(c) => Some(Event::Write(c)),
-        KeyCode::Tab => Some(Event::Write('\t')),
-        KeyCode::Backspace => Some(Event::BackSpace),
-        KeyCode::Enter => Some(Event::Enter),
-
-        _ => None,
-    }
-}
-
-fn handle_input_event_normal(code: KeyCode, _keys: &mut Vec<char>) -> Option<Event> {
-    match code {
-        KeyCode::Char('q') => Some(Event::Quit),
-        KeyCode::Char('i') => Some(Event::ChangeMode(Mode::Insert)),
-        KeyCode::Left => Some(Event::Motion {
-            op: None,
-            mult: 1,
-            motion: Some(Motion::Left),
-        }),
-        KeyCode::Right => Some(Event::Motion {
-            op: None,
-            mult: 1,
-            motion: Some(Motion::Right),
-        }),
-        KeyCode::Up => Some(Event::Motion {
-            op: None,
-            mult: 1,
-            motion: Some(Motion::Up),
-        }),
-        KeyCode::Down => Some(Event::Motion {
-            op: None,
-            mult: 1,
-            motion: Some(Motion::Down),
-        }),
-        _ => None,
-    }
-}
 
 pub struct Editor {
     stdout: Stdout,
     width: u16,
     height: u16,
-    cc: u16,
-    cr: u16,
+    cc: usize,
+    cr: usize,
     mode: Arc<Mutex<Mode>>,
     buffer: Buffer,
+    paste_buffer: Buffer,
 }
 
 impl Editor {
@@ -145,6 +42,7 @@ impl Editor {
             cr: 0,
             mode: Arc::new(Mutex::new(Mode::Normal)),
             buffer,
+            paste_buffer: Buffer::new(),
         })
     }
 
@@ -205,7 +103,7 @@ impl Editor {
             self.stdout,
             cursor::MoveTo(0, self.height - 2),
             PrintStyledContent(format!("{:?}", mode).magenta()),
-            cursor::MoveTo(self.cc, self.cr)
+            cursor::MoveTo(self.cc as u16, self.cr as u16)
         )?;
 
         self.stdout.flush()?;
@@ -220,7 +118,11 @@ impl Editor {
             Event::BackSpace => self.handle_backspace()?,
             Event::Enter => self.handle_enter()?,
             Event::Write(char) => self.handle_write(char)?,
-            _ => {}
+            Event::WindowResize(rows, cols) => {
+                self.width = cols;
+                self.height = rows;
+            }
+            Event::Motion { op, mult, motion } => self.handle_motion(op, mult, motion),
         }
 
         Ok(false)
@@ -234,7 +136,7 @@ impl Editor {
 
             self.cr -= 1;
             self.buffer.lines[self.cr as usize].extend(row.into_iter());
-            self.cc = self.buffer.lines[self.cr as usize].len() as u16;
+            self.cc = self.buffer.lines[self.cr as usize].len() as usize;
             return Ok(());
         }
 
@@ -272,4 +174,50 @@ impl Editor {
 
         Ok(())
     }
+
+    fn handle_motion(&mut self, op: Option<Operator>, mult: u8, motion: Option<Motion>) {
+        let start = (self.cr, self.cc);
+
+        if let Some(motion) = motion {
+            for _ in 0..mult as usize {
+                match motion {
+                    Motion::Up => {
+                        self.cr = (self.cr - 1).max(0);
+                        let row_len = self.buffer.lines[self.cr].len();
+                        self.cc = self.cc.min(row_len);
+                    }
+                    Motion::Down => {
+                        self.cr = (self.cr + 1).min(self.buffer.lines.len());
+                        let row_len = self.buffer.lines[self.cr].len();
+                        self.cc = self.cc.min(row_len);
+                    }
+                    Motion::Left => self.cc = (self.cc - 1).max(0),
+                    Motion::Right => {
+                        let row_len = self.buffer.lines[self.cr].len();
+                        self.cc = (self.cc + 1).min(row_len);
+                    }
+                    Motion::Start => self.cc = 0,
+                    Motion::End => {
+                        self.cc = self.buffer.lines[self.cr].len();
+                    }
+                    Motion::Word => {
+                        let row = &self.buffer.lines[self.cr];
+                        let next_space = row[self.cc..]
+                            .iter()
+                            .position(|c| *c == ' ')
+                            .unwrap_or(row.len());
+                        self.cc += next_space;
+                    }
+                }
+            }
+        }
+
+        let end = (self.cr, self.cc);
+
+        if let Some(op) = op {
+            self.apply_operation(op, start, end);
+        }
+    }
+
+    fn apply_operation(&self, _op: Operator, _start: (usize, usize), _end: (usize, usize)) {}
 }
